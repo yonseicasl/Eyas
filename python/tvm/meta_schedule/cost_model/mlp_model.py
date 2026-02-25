@@ -277,6 +277,15 @@ def lambda_rank_loss(  # pylint: disable=too-many-locals
         The lambda rank loss.
     """
     device = preds.device
+
+    # kyunam
+    # It throws an ValueError when pred and labels is a scalar Tensor (single value)
+    # So, first ensure that it has at least one dimension
+    if preds.dim() == 0:
+        preds = preds.unsqueeze(0)
+    if labels.dim() == 0:
+        labels = labels.unsqueeze(0)
+
     y_pred, y_true = preds[None, :], labels[None, :]
     y_pred_sorted, indices_pred = y_pred.sort(descending=True, dim=-1)
     y_true_sorted, _ = y_true.sort(descending=True, dim=-1)
@@ -329,6 +338,15 @@ def topk_score(
     score : float
         The top-k score
     """
+
+    # kyunam
+    # It throws an ValueError when pred and gt is a scalar Tensor (single value)
+    # So, first ensure that it has at least one dimension
+    if pred_results.dim() == 0:
+        pred_results = pred_results.unsqueeze(0)
+    if gt_results.dim() == 0:
+        gt_results = gt_results.unsqueeze(0)
+
     k = min(k, len(pred_results))
     topk_indices = torch.topk(pred_results, k, largest=False).indices
     score = gt_results.min() / gt_results[topk_indices].min()
@@ -366,6 +384,9 @@ class SegmentSumMLP(torch.nn.Module):
         use_norm: bool = False,
         use_sigmoid: bool = False,
     ):
+        print("MLP model is initialized with the following attributes:") # kyunam
+        print(f"input_dim: {input_dim}, hidden_dim: {hidden_dim}, output_dim: {output_dim}, use_norm: {use_norm}, use_sigmoid: {use_sigmoid}") # kyunam
+
         from torch import nn  # type: ignore
 
         super().__init__()
@@ -765,9 +786,20 @@ class SegmentSumMLPTrainer:
 
     def train_full(self):  # pylint: disable=too-many-locals
         """Training on the full dataset."""
+        print("tvm.meta_schedule.cost_model.mlp_model --> train_full() is called") # kyunam
+
         # split into training and testing set
         keys = list(self.state.data.keys())
         test_keys = random.sample(keys, k=math.floor(len(keys) * self.test_split))
+
+        # kyunam: if test_keys = [], following codes will throw a ValueError
+        # This mainly happens at the first N calls of train_full()
+        # In this case, skip the training
+        if not test_keys:
+            print(f"Too few test_keys could be selected from the keys: {keys}")
+            print("Skipping training this time...")
+            return
+
         train_data = OrderedDict()
         test_data = OrderedDict()
         for key in keys:
@@ -775,6 +807,7 @@ class SegmentSumMLPTrainer:
                 test_data[key] = self.state.data[key]
             else:
                 train_data[key] = self.state.data[key]
+
         train_features = list(
             itertools_chain.from_iterable([g.features for g in train_data.values()])
         )
@@ -849,6 +882,8 @@ class SegmentSumMLPTrainer:
         results: np.ndarray
             The measured results.
         """
+        print(f"tvm.meta_schedule.cost_model.mlp_model --> train_incremental() is called with {len(results)} results") # kyunam
+
         results = np.min(results) / results
         loader = SegmentDataLoader(features, results, batch_size=self.batch_size, shuffle=True)
         self.optimizer = torch.optim.Adam(
@@ -884,6 +919,9 @@ class SegmentSumMLPTrainer:
         pred_results: np.ndarray
             The predicted results.
         """
+
+        print(f"tvm.meta_schedule.cost_model.mlp_model --> predict_incremental() is called with {len(features)} candidates") # kyunam
+
         if results is not None:
             results = np.min(results) / results
         loader = SegmentDataLoader(features, results, batch_size=self.batch_size, shuffle=False)
@@ -892,6 +930,12 @@ class SegmentSumMLPTrainer:
         pred_results, losses, scores = [], [], []
         for data in loader:
             pred_results_batch, losses_batch, scores_batch = self.predict_step(data)
+
+            # kyunam
+            # Ensure that these are 1D tensors, not a scalar tensor
+            if pred_results_batch.ndim == 0:
+                pred_results_batch = np.expand_dims(pred_results_batch, axis=0)
+
             pred_results.append(pred_results_batch)
             losses.append(losses_batch)
             scores.append(scores_batch)
@@ -924,6 +968,9 @@ class SegmentSumMLPTrainer:
         group_hash: str
             The hash of the group.
         """
+
+        print(f"tvm.meta_schedule.cost_model.mlp_model --> update() is called with {len(costs)} results") # kyunam
+
         self.state.add_to_group(features, costs, group_hash)
         if not self.frozen:
             self.predict_incremental(features, costs)

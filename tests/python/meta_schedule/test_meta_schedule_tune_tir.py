@@ -62,7 +62,7 @@ def two_step(a: T.handle, c: T.handle) -> None:
             C[vi, vj] = B[vi, vj] + 3.0
 
 
-@pytest.mark.skip("Integration test")
+# @pytest.mark.skip("Integration test")
 @tvm.testing.requires_llvm
 def test_tune_matmul_cpu():
     with tempfile.TemporaryDirectory() as work_dir:
@@ -71,7 +71,8 @@ def test_tune_matmul_cpu():
             mod=matmul,
             target=target,
             work_dir=work_dir,
-            max_trials_global=32,
+            max_trials_global=320, # kyunam
+            # max_trials_global=32,  # original
             num_trials_per_iter=16,
         )
         sch = ms.tir_integration.compile_tir(database, matmul, target)
@@ -80,7 +81,6 @@ def test_tune_matmul_cpu():
         else:
             sch.mod.show()
             sch.trace.show()
-
 
 @pytest.mark.skip("Integration test")
 @tvm.testing.requires_cuda

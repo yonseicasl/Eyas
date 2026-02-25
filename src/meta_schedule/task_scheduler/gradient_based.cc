@@ -17,6 +17,8 @@
  * under the License.
  */
 #include "../utils.h"
+#include <cstdlib> // kyunam
+#include <cmath> // kyunam
 
 namespace tvm {
 namespace meta_schedule {
@@ -30,6 +32,10 @@ class GradientBasedNode final : public TaskSchedulerNode {
 
   int round_robin_rounds_;
   std::vector<std::vector<double>> best_latency_history_;
+
+  // kyunam
+  // If no valid candidate is found during the first trial of a task, let it try again
+  int mercy_ = 3;
 
   void VisitAttrs(tvm::AttrVisitor* v) {
     TaskSchedulerNode::VisitAttrs(v);
@@ -103,8 +109,15 @@ class GradientBasedNode final : public TaskSchedulerNode {
         double g = alpha * g1 + (1 - alpha) * g2;
         grad.push_back(g * task_weight);
       } else {
-        // If the best time cost is unavailable, it means some task is not valid. Skip it.
-        grad.push_back(-1e9);
+        // original
+        // // If the best time cost is unavailable, it means some task is not valid. Skip it.
+        // grad.push_back(-1e9);
+
+        // kyunam
+        // If a task seems not valid (no valid candidate found during the first trial of the task), let it try more
+        if (n < mercy_) grad.push_back(1e9);
+        // If the task tried enough and still seems invalid, then give up
+        else grad.push_back(-1e9);
       }
     }
     // Step 4. Select the task with the largest gradient
@@ -126,9 +139,59 @@ class GradientBasedNode final : public TaskSchedulerNode {
     Array<RunnerResult> results = TaskSchedulerNode::JoinRunningTask(task_id);
     TaskRecordNode* task = this->tasks_[task_id].get();
     if (task->latency_ms.size() > 0) {
-      this->best_latency_history_.at(task_id).push_back(
-          *std::min_element(task->latency_ms.begin(),  //
-                            task->latency_ms.end()));
+      /* original code */
+      // this->best_latency_history_.at(task_id).push_back(
+      //     *std::min_element(task->latency_ms.begin(),  //
+      //                       task->latency_ms.end()));
+      
+      // Put the best T into the history, so that NextTaskId() chooses the task that is most likely to be improved
+      // Find the best candidate that has the lowest T
+      // Here, best_latency_history_ is only used for selecting the next task id, not for actually optimizing tasks
+      // So, even for the power-incompliant schedules, recover the original, unmodified latency value before calculating T
+      // so that the task selection works as intended
+      auto min_it = std::min_element(task->latency_ms.begin(), task->latency_ms.end(), 
+        [](double a, double b) {
+            auto compute_T = [](double cost_1000) {
+                // Extract power and delay value from the cost
+                double cost = cost_1000 / 1000;
+                double power = std::floor((cost / 1000.0) * 10.0) / 10.0;
+                double delay = cost - (power * 1000.0);
+                if (power > 1e6 || delay == 0 || cost_1000 == 1e9) delay = 1e10; // Account for failed candidates
+                if (delay != 1e10 && delay > 50) delay -= 50; // Account for power-incompliant schedule's modified latency value
+
+                // Get power exponent and delay exponent from environment variables
+                // Default T = (power ^ 0) * (delay ^ 1) = delay
+                const char* p = std::getenv("TVMP_POWER_EXP");
+                double power_exp = p ? std::strtod(p, nullptr) : 0.0;
+                p = std::getenv("TVMP_LATENCY_EXP");
+                double delay_exp = p ? std::strtod(p, nullptr) : 1.0;
+
+                // Calculate T = (power ^ TVMP_POWER_EXP) * (delay ^ TVMP_DELAY_EXP)
+                double T = std::pow(power, power_exp) * std::pow(delay, delay_exp); 
+                return T;
+            };
+            return compute_T(a) < compute_T(b);
+        }
+      );
+
+      // Calculate T
+      // Extract power and delay from the cost
+      double cost = (*min_it) / 1000;
+      double power = std::floor((cost / 1000.0) * 10.0) / 10.0;
+      double delay = cost - (power * 1000.0);
+      if (power > 1e6 || delay == 0) delay = 1e10; // Account for failed candidates
+      if (delay != 1e10 && delay > 50) delay -= 50; // Account for power-incompliant schedule's modified latency value
+
+      // Get power exponent and delay exponent from environment variables
+      // Default T = (power ^ 0) * (delay ^ 1) = delay
+      const char* p = std::getenv("TVMP_POWER_EXP");
+      double power_exp = p ? std::strtod(p, nullptr) : 0.0;
+      p = std::getenv("TVMP_LATENCY_EXP");
+      double delay_exp = p ? std::strtod(p, nullptr) : 1.0;
+
+      // Calculate T = (power ^ TVMP_POWER_EXP) * (delay ^ TVMP_DELAY_EXP)
+      double T = std::pow(power, power_exp) * std::pow(delay, delay_exp); 
+      this->best_latency_history_.at(task_id).push_back(T);
     }
     return results;
   }

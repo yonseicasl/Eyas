@@ -100,7 +100,7 @@ class MetaScheduleTuner {
   const runtime::PackedFunc* normalize_mod_func_;
 };
 
-Pass MetaScheduleApplyDatabase(Optional<String> work_dir, bool enable_warning = false) {
+Pass MetaScheduleApplyDatabase(Optional<String> work_dir, bool enable_warning = true) {
   using tvm::meta_schedule::Database;
   Target target = Target::Current(false);
   const runtime::PackedFunc* normalize_mod_func_ =
@@ -126,6 +126,7 @@ Pass MetaScheduleApplyDatabase(Optional<String> work_dir, bool enable_warning = 
     for (const auto& iter : mod->functions) {
       GlobalVar gv = iter.first;
       BaseFunc base_func = iter.second;
+      std::cout << "Applying the best record of the primfunc: " << gv->name_hint << std::endl;
       if (const auto* prim_func_node = base_func.as<tir::PrimFuncNode>()) {
         tir::PrimFunc prim_func = GetRef<tir::PrimFunc>(prim_func_node);
 
@@ -133,6 +134,7 @@ Pass MetaScheduleApplyDatabase(Optional<String> work_dir, bool enable_warning = 
         if (Optional<meta_schedule::TuningRecord> opt_record =
                 database->QueryTuningRecord(tir_mod, target, gv->name_hint)) {
           meta_schedule::TuningRecord record = opt_record.value();
+	        std::cout << "\tBest record: " << record->run_secs << std::endl;
           tir::Schedule sch{nullptr};
           if (!mod_eq_structural->Equal(tir_mod, record->workload->mod)) {
             // When the database lookup succeeds while structural equality check fails,
@@ -163,6 +165,7 @@ Pass MetaScheduleApplyDatabase(Optional<String> work_dir, bool enable_warning = 
           result.Set(gv, new_prim_func);
           continue;
         } else if (enable_warning) {
+	        std::cout << "Tuning record is not found for primfunc: " << gv->name_hint << std::endl;
           LOG(WARNING) << "Tuning record is not found for primfunc: " << gv->name_hint;
         }
       }

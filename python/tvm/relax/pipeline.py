@@ -28,7 +28,7 @@ from tvm import meta_schedule as ms
 from . import transform, backend
 
 
-def zero_pipeline(*, enable_warning: bool = False):
+def zero_pipeline(*, enable_warning: bool = True):
     """Wrapper function that returns the zero pipeline.
 
     Parameters
@@ -70,6 +70,8 @@ def zero_pipeline(*, enable_warning: bool = False):
         mod = seq(mod)
         if ms.Database.current():
             mod = transform.MetaScheduleApplyDatabase(enable_warning=enable_warning)(mod)
+        else:
+            print("No current database!")
         return mod
 
     return f_zero_pipeline
@@ -180,7 +182,7 @@ def static_shape_tuning_pipeline(
                         if total_trials > 0
                         else tvm.transform.Sequential([])
                     ),
-                    transform.MetaScheduleApplyDatabase(work_dir),
+                    transform.MetaScheduleApplyDatabase(work_dir, enable_warning=True),
                     *post_tuning_layout_rewrite,
                 ]
             )(mod)

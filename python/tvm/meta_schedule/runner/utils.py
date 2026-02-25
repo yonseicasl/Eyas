@@ -101,16 +101,30 @@ def run_evaluator_common(
     costs: List[float]
         The evaluator results
     """
+    # evaluator = rt_mod.time_evaluator(
+    #     func_name=rt_mod.entry_name,
+    #     dev=device,
+    #     number=evaluator_config.number,
+    #     repeat=evaluator_config.repeat,
+    #     min_repeat_ms=evaluator_config.min_repeat_ms,
+    #     f_preproc="cache_flush_cpu_non_first_arg"
+    #     if evaluator_config.enable_cpu_cache_flush
+    #     else "",
+    # )
+
+    # kyunam
+    # Minimum exec time is 300ms for each candidate
     evaluator = rt_mod.time_evaluator(
         func_name=rt_mod.entry_name,
         dev=device,
         number=evaluator_config.number,
         repeat=evaluator_config.repeat,
-        min_repeat_ms=evaluator_config.min_repeat_ms,
+        min_repeat_ms=300,
         f_preproc="cache_flush_cpu_non_first_arg"
         if evaluator_config.enable_cpu_cache_flush
         else "",
     )
+
     repeated_costs: List[List[float]] = []
     for args in repeated_args:
         device.sync()

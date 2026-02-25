@@ -37,6 +37,8 @@
 #include "rpc_endpoint.h"
 #include "rpc_session.h"
 
+#include <iostream> // kyunam
+
 namespace tvm {
 namespace runtime {
 
@@ -382,12 +384,19 @@ TVM_REGISTER_GLOBAL("runtime.RPCTimeEvaluator")
                        int number, int repeat, int min_repeat_ms, int limit_zero_time_iterations,
                        int cooldown_interval_ms, int repeats_to_cooldown, int cache_flush_bytes,
                        std::string f_preproc_name) {
+      // std::cout << "<rpc_module.cc> RPCTimeEvaluator is called" << std::endl; // kyunam
+
       Device dev;
       dev.device_type = static_cast<DLDeviceType>(device_type);
       dev.device_id = device_id;
       if (opt_mod.defined()) {
+        // std::cout << "<rpc_module.cc> opt_mod is defined" << std::endl; // kyunam
+
         Module m = opt_mod.value();
         std::string tkey = m->type_key();
+
+        // std::cout << "<rpc_module.cc> type_key is " << tkey << std::endl; // kyunam
+
         if (tkey == "rpc") {
           return static_cast<RPCModuleNode*>(m.operator->())
               ->GetTimeEvaluator(name, dev, number, repeat, min_repeat_ms,

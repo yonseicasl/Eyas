@@ -16,10 +16,22 @@
 # under the License.
 # pylint: disable=redefined-builtin, wildcard-import
 """TVM: Open Deep Learning Compiler Stack."""
+
 import multiprocessing
 import sys
 import os
 import traceback
+
+# kyunam
+hello_str = "TVM + Eyas\n"
+_dataset_construction_mode = int(os.getenv('TVMP_CONSTRUCT_DATASET', 0)) == 1
+hello_str += f"Dataset construction mode: {'Enabled' if _dataset_construction_mode else 'Disabled'}\n"
+_power_cap = int(os.getenv('TVMP_POWER_CAP', 0))
+hello_str += f"Power capping: {str(_power_cap) + 'W' if _power_cap > 0 else 'Disabled'}\n"
+_power_exp = float(os.getenv('TVMP_POWER_EXP', 0))
+_delay_exp = float(os.getenv('TVMP_LATENCY_EXP', 1))
+hello_str += f"Target metric: T = (power ^ {_power_exp}) * (latency ^ {_delay_exp})\n"
+print(hello_str)
 
 # top-level alias
 # tvm._ffi

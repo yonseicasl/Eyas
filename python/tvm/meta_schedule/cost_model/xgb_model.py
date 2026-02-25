@@ -15,6 +15,13 @@
 # specific language governing permissions and limitations
 # under the License.
 """XGBoost-based cost model"""
+
+# kyunam
+from datetime import datetime
+from .power_model import power_model
+from math import floor as math_floor
+from math import pow as math_pow
+
 import os
 import tempfile
 from collections import OrderedDict
@@ -93,7 +100,13 @@ class PackSum:
         """
         import xgboost as xgb  # type: ignore # pylint: disable=import-outside-toplevel
 
-        repeats = [x.shape[0] for x in xs]
+        # Structure of xs
+        # xs is a 3D array
+        # xs = [ features_of_candidate_#1 , features_of_candidate_#2 , features_of_candidate_#3 , ... ]
+        # features_of_candidate_#N = [ per_store_features_of_bufferstore_node_#1 , per_store_features_of_bufferstore_node_#2 , ... ]
+        # per_store_features_of_buffer_store_node_#n: a list of length 164
+
+        repeats = [x.shape[0] for x in xs] # repeats = [ the_number_of_bufferstore_nodes_in_candidate_#1 , that_of_candidate_#2 , ... ]
         xs = np.concatenate(xs, axis=0)
         self.ids = np.concatenate([[i] * repeat for i, repeat in enumerate(repeats)], axis=0)
         if ys is None:
@@ -329,6 +342,14 @@ class XGBModel(PyCostModel):
     adaptive_training: bool
     last_train_size: int
 
+    # kyunam
+    # power model
+    power_model: power_model.PowerModel
+    # power and edp of the best-edp candidate
+    T_of_best_candidate: dict
+    power_of_best_candidate: dict
+    delay_of_best_candidate: dict
+
     def __init__(
         self,
         *,
@@ -376,6 +397,15 @@ class XGBModel(PyCostModel):
         # adaptive training
         self.adaptive_training = adaptive_training
         self.last_train_size = 0
+
+        # kyunam
+        # power model
+        self.power_model = power_model.get_power_model()
+        self.T_of_best_candidate = {}
+        self.power_of_best_candidate = {}
+        self.delay_of_best_candidate = {}
+
+
 
     def load(self, path: str) -> None:
         """Load the cost model from given file location.
@@ -464,6 +494,8 @@ class XGBModel(PyCostModel):
         candidates: List[MeasureCandidate],
         results: List[RunnerResult],
     ) -> None:
+        # print(f"XGBModel.update() is called with {len(candidates)} MeasureCandidates and {len(results)} RunnerResults") # kyunam
+
         """Update the cost model given running results.
 
         Parameters
@@ -495,12 +527,35 @@ class XGBModel(PyCostModel):
         new_features = [_feature(x) for x in self.extractor.extract_from(context, candidates)]
         new_mean_costs = [_mean_cost(x) for x in results]
 
+        # Recover power and latency data from final_value from C++ backend
+        powers = []
+        delays = []
+        for cost in new_mean_costs:
+            recovered_power = math_floor((cost / 1e3) * 10.0) / 10.0
+            recovered_delay = cost - (recovered_power * 1e3)
+            if recovered_power > 1e6 or recovered_delay == 0:
+                # Account for failed candidates
+                recovered_delay = 1e10
+            delays.append(recovered_delay)
+            powers.append(recovered_power)
+        new_mean_costs = delays # So that the rest of the update() works as intended
+
         # Filter instances with no features
         new_mean_costs = [c for i, c in enumerate(new_mean_costs) if len(new_features[i]) != 0]
         new_mean_costs_np = np.array(new_mean_costs).astype("float32")
         new_features = [f for f in new_features if len(f) != 0]
         if not new_features:
             return
+
+        # kyunam
+        # Print schedules
+        # for i, cand in enumerate(candidates):
+        #     print(f'Candidate #{i + 1:2d}:')
+        #     sch_trace = str(cand.sch.trace)
+        #     print(sch_trace)
+        #     if 'tensorize' in sch_trace:
+        #         print("***** 'tensorize' is applied to the module *****")
+        #     print()
 
         # Steps 3. Run validation
         if group is not None and self.booster is not None:
@@ -515,6 +570,26 @@ class XGBModel(PyCostModel):
                 ),
             )
 
+        # Determine the target metric (T)
+        # Default value is latency ( = power^0 * delay^1 )
+        power_exp = float(os.getenv("TVMP_POWER_EXP", 0))
+        delay_exp = float(os.getenv("TVMP_LATENCY_EXP", 1))
+        def calc_T(power, delay):
+            return (power ** power_exp) * (delay ** delay_exp)
+
+        # Print T improvement prediction vs GT values
+        # if group is not None and self.booster is not None:
+        #     # Print predictions before update
+        #     kn_pred = self.predict(context, candidates)
+        #     print(f"Predicted target metric (= power^{power_exp} * delay^{delay_exp}) improvements before update: ")
+        #     print(kn_pred)
+        #     # Print ground-truth values
+        #     best_T = self.T_of_best_candidate[new_group_hash]
+        #     kn_gt = [best_T / calc_T(powers[i], delays[i]) for i in range(len(candidates))]
+        #     kn_gt = np.array(kn_gt).astype("float64")
+        #     print(f"Ground-truth target metric (= power^{power_exp} * delay^{delay_exp}) improvements before update:")
+        #     print(kn_gt)
+
         # Step 4. Add the features into the data points
         if group is None:
             group = FeatureGroup(
@@ -527,12 +602,32 @@ class XGBModel(PyCostModel):
         self.data[new_group_hash] = group
         self.data_size += len(new_features)
 
+        # Track the power, delay, and T of the best candidate
+        if new_group_hash not in self.T_of_best_candidate.keys():
+            self.T_of_best_candidate[new_group_hash] = 1e10
+            self.power_of_best_candidate[new_group_hash] = 1e10
+            self.delay_of_best_candidate[new_group_hash] = 1e10
+        assert len(powers) == len(delays)
+        for i in range(len(powers)):
+            T_of_ith_cand = calc_T(powers[i], delays[i])
+            if T_of_ith_cand < self.T_of_best_candidate[new_group_hash]:
+                self.T_of_best_candidate[new_group_hash] = T_of_ith_cand
+                self.power_of_best_candidate[new_group_hash] = powers[i]
+                self.delay_of_best_candidate[new_group_hash] = delays[i]
+                # print(f"Task {context.task_name}: new best target metric (= power^{power_exp} * delay^{delay_exp}) is {T_of_ith_cand}, with power {powers[i]:.1f} W and latency {delays[i]} s")
+
+        # Adaptive training of XGBModel (latency)
         if (
             self.adaptive_training
             and self.data_size - self.last_train_size < self.last_train_size / 5
         ):
             # Set a training threshold related to `last_train_size` to reduce the training
             # overhead when there're too many results
+
+            # print("Training is skipped due to insufficient new hardware data.") # kyunam
+            # print(f"# samples used in the last training session: {self.last_train_size}") # kyunam
+            # print(f"# samples currently available: {self.data_size}") # kyunam
+
             return
         self.last_train_size = self.data_size
 
@@ -545,35 +640,57 @@ class XGBModel(PyCostModel):
             ),
         )
 
+
+    # Predict the T improvement
     def predict(
         self,
         context: "TuneContext",
         candidates: List[MeasureCandidate],
     ) -> np.ndarray:
-        """Predict the normalized score using the cost model.
 
-        Parameters
-        ----------
-        context : TuneContext
-            The tuning context.
-        candidates : List[MeasureCandidate]
-            The measure candidates.
+        print(f"XGBModel.predict() is called with {len(candidates)} MeasureCandidates") # kyunam
 
-        Return
-        ------
-        result : np.ndarray
-            The predicted normalized score.
-        """
+        # Check if XGBModel is ready to predict
         if self.data_size >= self.num_warmup_samples and self.booster is not None:
-            ret = self._predict(
-                xs=[
-                    x.numpy().astype("float32")
-                    for x in self.extractor.extract_from(
-                        context,
-                        candidates,
-                    )
-                ]
-            )
+            # Extract per-store features from each MeasureCandidate
+            extracted_features = [x.numpy().astype("float32") for x in self.extractor.extract_from(context, candidates)]
+
+            # Predict the latency improvement of each MeasureCandidate (TVM)
+            # Add a very small number to prevent dividing by zero
+            latency_improvement_preds = self._predict(xs=extracted_features) + 1e-10
+
+            # Note that XGB returns the relative improvement (e.g., 0.8, 1.1, ...) of the latency w.r.t. the best latency
+            # Since we know the best latency recorded for this group, we can recalculate the predicted latency
+            # cost = best_latency / new_latency --> new_latency = best_latency / cost
+            group_hash = shash2hex(context.mod)
+            group = self.data.get(group_hash, None)
+            best_latency = group.min_cost
+            latency_preds = best_latency / latency_improvement_preds
+
+            # Predict the power consumption of each MeasureCandidate
+            power_preds = self.power_model.predict(extracted_features)
+
+            # Determine the target metric (T)
+            # Default value is latency ( = (power ^ 0) * (delay ^ 1) )
+            power_exp = float(os.getenv("TVMP_POWER_EXP", 0))
+            delay_exp = float(os.getenv("TVMP_LATENCY_EXP", 1))
+
+            # Generate the final cost predictions
+            power_of_best_cand = self.power_of_best_candidate[group_hash]
+            delay_of_best_cand = self.delay_of_best_candidate[group_hash]
+            T_imprv_preds = []
+            assert len(latency_preds) == len(power_preds) == len(candidates)
+            for i in range(len(latency_preds)):
+                T_imprv_pred = ((power_of_best_cand / power_preds[i]) ** power_exp) * ((delay_of_best_cand / latency_preds[i]) ** delay_exp)
+                T_imprv_preds.append(T_imprv_pred)
+            ret = np.array(T_imprv_preds)
+
+            # Mask the power-incompliant candidates
+            power_cap = int(os.getenv("TVMP_POWER_CAP", 0))
+            if power_cap > 0:
+                for i in range(len(power_preds)):
+                    if power_preds[i] > power_cap:
+                        ret[i] = 0
         else:
             ret = np.random.uniform(
                 low=0,
@@ -581,6 +698,47 @@ class XGBModel(PyCostModel):
                 size=(len(candidates),),
             )
         return ret.astype("float64")
+
+
+    # backup original
+    # def predict(
+    #     self,
+    #     context: "TuneContext",
+    #     candidates: List[MeasureCandidate],
+    # ) -> np.ndarray:
+    #     print(f"XGBModel.predict() is called with {len(candidates)} MeasureCandidates") # kyunam
+    #
+    #     """Predict the normalized score using the cost model.
+    #
+    #     Parameters
+    #     ----------
+    #     context : TuneContext
+    #         The tuning context.
+    #     candidates : List[MeasureCandidate]
+    #         The measure candidates.
+    #
+    #     Return
+    #     ------
+    #     result : np.ndarray
+    #         The predicted normalized score.
+    #     """
+    #     if self.data_size >= self.num_warmup_samples and self.booster is not None:
+    #         ret = self._predict(
+    #             xs=[
+    #                 x.numpy().astype("float32")
+    #                 for x in self.extractor.extract_from(
+    #                     context,
+    #                     candidates,
+    #                 )
+    #             ]
+    #         )
+    #     else:
+    #         ret = np.random.uniform(
+    #             low=0,
+    #             high=1,
+    #             size=(len(candidates),),
+    #         )
+    #     return ret.astype("float64")
 
     def _train(  # type: ignore # pylint: disable=invalid-name
         self,

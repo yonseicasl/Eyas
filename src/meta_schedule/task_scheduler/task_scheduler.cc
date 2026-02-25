@@ -17,6 +17,7 @@
  * under the License.
  */
 #include "../utils.h"
+#include <cstdlib> // kyunam
 
 namespace tvm {
 namespace meta_schedule {
@@ -268,13 +269,24 @@ void TaskSchedulerNode::PrintTuningStatistics() {
   int total_trials = 0;
   double total_latency = 0.0;
   support::TablePrinter p;
+
+  // Print target metric
+  // Get power exponent and delay exponent from environment variables
+  // Default T = (power ^ 0) * (delay ^ 1) = delay
+  const char* p_ = std::getenv("TVMP_POWER_EXP");
+  double power_exp = p_ ? std::strtod(p_, nullptr) : 0.0;
+  p_ = std::getenv("TVMP_LATENCY_EXP");
+  double delay_exp = p_ ? std::strtod(p_, nullptr) : 1.0;
+  std::cout << "Target metric: T = (power ^ " << power_exp << ") * (latency ^ " << delay_exp << ")" << std::endl;
+
   p.Row() << "ID"
           << "Name"
           << "FLOP"
           << "Weight"
-          << "Speed (GFLOPS)"
+          << "Power (W)"
           << "Latency (us)"
           << "Weighted Latency (us)"
+          << "Target Metric"
           << "Trials"
           << "Done";
   p.Separator();
@@ -285,19 +297,75 @@ void TaskSchedulerNode::PrintTuningStatistics() {
     row << /*id=*/i << /*name=*/task->ctx->task_name.value()  //
         << /*flops=*/static_cast<int64_t>(task->flop)
         << /*weight=*/static_cast<int>(task->task_weight);
+
     double latency_ms = 1e9;
     if (!task->latency_ms.empty()) {
-      latency_ms = *std::min_element(task->latency_ms.begin(), task->latency_ms.end());
+      // original code
+      // latency_ms = *std::min_element(task->latency_ms.begin(), task->latency_ms.end());
+
+      // Find the element of the lowest (best) T
+      // Here, we should find and print the best schedule found so far; one that TVM would choose if it deploys the model now
+      // So, we use a power-incompliant schedule's modified latency value as is when calculating T (to avoid choosing it),
+      // so that the power-compliant schedule which achieved the lowest T is selected here
+      // Note: if there are no power-compliant schedules found so far, 
+      // it is likely, but not guaranteed, that TVM chooses the schedule that achieved the smallest target metric value
+      // However, this problem should be solved as the autotuning goes on, 
+      // since there would be at least one schedule that is power-compliant
+      // If not, the task is likely to be not important at all
+      auto min_it = std::min_element(task->latency_ms.begin(), task->latency_ms.end(), 
+        [](double a, double b) {
+            auto compute_T = [](double cost_1000) {
+                // Extract power and delay value from the cost
+                double cost = cost_1000 / 1000;
+                double power = std::floor((cost / 1000.0) * 10.0) / 10.0;
+                double delay = cost - (power * 1000.0);
+                if (power > 1e6 || delay == 0 || cost_1000 == 1e9) delay = 1e10; // Account for failed candidates
+
+                // Get power exponent and delay exponent from environment variables
+                // Default T = (power ^ 0) * (delay ^ 1) = delay
+                const char* p = std::getenv("TVMP_POWER_EXP");
+                double power_exp = p ? std::strtod(p, nullptr) : 0.0;
+                p = std::getenv("TVMP_LATENCY_EXP");
+                double delay_exp = p ? std::strtod(p, nullptr) : 1.0;
+
+                // Calculate T = (power ^ TVMP_POWER_EXP) * (delay ^ TVMP_DELAY_EXP)
+                double T = std::pow(power, power_exp) * std::pow(delay, delay_exp); 
+                return T;
+            };
+            return compute_T(a) < compute_T(b);
+        }
+      );
+      latency_ms = *min_it;
     }
-    if (latency_ms >= 1e9) {
-      row << /*speed=*/"N/A" << /*latency=*/"N/A" << /*weighted_latency=*/"N/A";
+    
+    // Now, the 'latency_ms' has the best T value
+    if (latency_ms == 1e9) {
+      row << /*power=*/"N/A" << /*latency=*/"N/A" << /*weighted_latency=*/"N/A" << /*T=*/"N/A";
     } else {
-      latency_ms *= 1000.0;
-      double speed = task->flop / latency_ms / 1000.0;
-      double weighted_latency = latency_ms * task->task_weight;
-      row << /*speed=*/speed << /*latency=*/latency_ms << /*weighted_latency=*/weighted_latency;
+      // Recover power and latency from the profiling data
+      // These values will be printed to console; hence, we recover the original latency value before modification
+      double cost = latency_ms / 1000; 
+      double power = std::floor((cost / 1000.0) * 10.0) / 10.0;
+      double delay = cost - (power * 1000.0);
+      if (power > 1e6 || delay == 0 || latency_ms == 1e9) delay = 1e10; // Account for failed candidates
+      if (delay != 1e10 && delay > 50) {
+        delay -= 50; // Account for power-incompliant schedule's modified latency value
+        // Power capping failed for this task as of now... more trials would likely solve the problem 
+      } 
+
+      if (delay == 1e10) {
+        row << /*power=*/"N/A" << /*latency=*/"N/A" << /*weighted_latency=*/"N/A" << /*T=*/"N/A";
+      } else {
+      // Calculate T = (power ^ TVMP_POWER_EXP) * (delay ^ TVMP_DELAY_EXP)
+      double T = std::pow(power, power_exp) * std::pow(delay, delay_exp); 
+
+      double latency_us = delay * 1e6;
+      double weighted_latency = latency_us * task->task_weight;
+      row << /*power=*/power << /*latency=*/latency_us << /*weighted_latency=*/weighted_latency << /*T=*/T;
+
       total_latency += weighted_latency;
       total_trials += trials;
+      }
     }
     row << trials;
     if (task->is_terminated) {

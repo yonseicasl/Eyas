@@ -25,6 +25,7 @@ from .runner import Runner
 from .task_scheduler import TaskScheduler
 from .tune_context import TuneContext
 
+import os
 
 def tune_tasks(
     *,
@@ -100,7 +101,11 @@ def tune_tasks(
     if max_trials_per_task is None:
         max_trials_per_task = max_trials_global
     if not isinstance(builder, Builder):
-        builder = Builder.create(builder, max_workers=num_cores)
+        # builder = Builder.create(builder, max_workers=num_cores)
+
+        # Using too many builders in a KNL node results in a system halt (memory-related error)
+        num_builders = min(num_cores, 32) # kyunam
+        builder = Builder.create(builder, max_workers=num_builders) # kyunam
     if not isinstance(runner, Runner):
         runner = Runner.create(runner, max_workers=num_cores)
     if database == "json":
@@ -108,7 +113,13 @@ def tune_tasks(
     elif not isinstance(database, Database):
         database = Database.create(database, module_equality=module_equality)
     if not isinstance(cost_model, CostModel):
-        cost_model = CostModel.create(cost_model, num_tuning_cores=num_cores, tree_method="auto")
+        # kyunam
+        if int(os.getenv("TVMP_CONSTRUCT_DATASET", 0)) == 1:
+            # Use RandomModel so that we can obtain diverse power data
+            cost_model = CostModel.create("random")
+        else:
+            # Use XGBModel to enable tuning
+            cost_model = CostModel.create(cost_model, num_tuning_cores=num_cores, tree_method="auto")
     if isinstance(measure_callbacks, MeasureCallback):
         measure_callbacks = [measure_callbacks]
     elif measure_callbacks == "default":

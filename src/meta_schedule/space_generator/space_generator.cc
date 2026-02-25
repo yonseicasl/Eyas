@@ -89,6 +89,8 @@ void SpaceGeneratorNode::InitializeWithTuneContext(const TuneContext& context) {
         postprocs.defined() &&      //
         mutator_probs.defined())) {
     String kind = GetRuleKindFromTarget(context->target.value());
+    std::cout << "<space_generator.cc> kind: " << kind << std::endl; // kyunam
+
     Array<ScheduleRule> default_sch_rules;
     Array<Postproc> default_postprocs;
     Map<Mutator, FloatImm> default_mutator_probs;

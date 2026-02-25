@@ -37,6 +37,18 @@
 #include <numeric>
 #include <thread>
 
+// kyunam
+#include <fstream> 
+#include <unistd.h>     // pipe, fork, dup2, execl, usleep, close
+#include <sys/types.h>
+#include <sys/wait.h>   // waitpid
+#include <sys/stat.h>   // stat
+#include <csignal>      // kill, SIGINT
+#include <vector>
+#include <string>
+#include <cstdlib>      // std::stod, std::getenv
+#include <cmath> 
+
 namespace tvm {
 namespace runtime {
 
@@ -862,7 +874,12 @@ TVM_REGISTER_GLOBAL("runtime.profiling.ProfileFunction")
 PackedFunc WrapTimeEvaluator(PackedFunc pf, Device dev, int number, int repeat, int min_repeat_ms,
                              int limit_zero_time_iterations, int cooldown_interval_ms,
                              int repeats_to_cooldown, int cache_flush_bytes, PackedFunc f_preproc) {
+  // std::cout << "<profiling.cc> WrapTimeEvaluator is called" << std::endl; // kyunam
+
   ICHECK(pf != nullptr);
+
+  // std::cout << "<profiling.cc> device_type is " << static_cast<int>(dev.device_type) << std::endl; // kyunam
+  // 1: kDLCPU, 2: kDLCUDA, 3: kDLCUDAHost, ... // kyunam
 
   if (static_cast<int>(dev.device_type) == static_cast<int>(kDLMicroDev)) {
     auto get_micro_time_evaluator = runtime::Registry::Get("micro._GetMicroTimeEvaluator");
@@ -870,9 +887,75 @@ PackedFunc WrapTimeEvaluator(PackedFunc pf, Device dev, int number, int repeat, 
     return (*get_micro_time_evaluator)(pf, dev, number, repeat);
   }
 
-  auto ftimer = [pf, dev, number, repeat, min_repeat_ms, limit_zero_time_iterations,
+  // std::cout << "<profiling.cc> ftimer as a lambda function is being defined and returned to python" << std::endl; // kyunam
+
+  // Original ftimer
+  // auto ftimer = [pf, dev, number, repeat, min_repeat_ms, limit_zero_time_iterations,
+  //                cooldown_interval_ms, repeats_to_cooldown, cache_flush_bytes,
+  //                f_preproc](TVMArgs args, TVMRetValue* rv) mutable {
+  //   TVMRetValue temp;
+  //   std::ostringstream os;
+  //   // skip first time call, to activate lazy compilation components.
+  //   pf.CallPacked(args, &temp);
+
+  //   // allocate two large arrays to flush L2 cache
+  //   NDArray arr1, arr2;
+  //   if (cache_flush_bytes > 0) {
+  //     arr1 = NDArray::Empty({cache_flush_bytes / 4}, {kDLInt, 32, 1}, dev);
+  //     arr2 = NDArray::Empty({cache_flush_bytes / 4}, {kDLInt, 32, 1}, dev);
+  //   }
+
+  //   DeviceAPI::Get(dev)->StreamSync(dev, nullptr);
+
+  //   for (int i = 0; i < repeat; ++i) {
+  //     if (f_preproc != nullptr) {
+  //       f_preproc.CallPacked(args, &temp);
+  //     }
+  //     double duration_ms = 0.0;
+  //     int absolute_zero_times = 0;
+  //     do {
+  //       if (duration_ms > 0.0) {
+  //         const double golden_ratio = 1.618;
+  //         number = static_cast<int>(
+  //             std::max((min_repeat_ms / (duration_ms / number) + 1), number * golden_ratio));
+  //       }
+  //       if (cache_flush_bytes > 0) {
+  //         arr1.CopyFrom(arr2);
+  //       }
+  //       DeviceAPI::Get(dev)->StreamSync(dev, nullptr);
+  //       // start timing
+  //       Timer t = Timer::Start(dev);
+  //       for (int j = 0; j < number; ++j) {
+  //         pf.CallPacked(args, &temp);
+  //       }
+  //       t->Stop();
+  //       int64_t t_nanos = t->SyncAndGetElapsedNanos();
+  //       if (t_nanos == 0) absolute_zero_times++;
+  //       duration_ms = t_nanos / 1e6;
+  //     } while (duration_ms < min_repeat_ms && absolute_zero_times < limit_zero_time_iterations);
+
+  //     double speed = duration_ms / 1e3 / number;
+  //     os.write(reinterpret_cast<char*>(&speed), sizeof(speed));
+
+  //     if (cooldown_interval_ms > 0 && (i % repeats_to_cooldown) == 0) {
+  //       std::this_thread::sleep_for(std::chrono::milliseconds(cooldown_interval_ms));
+  //     }
+  //   }
+
+  //   std::string blob = os.str();
+  //   TVMByteArray arr;
+  //   arr.size = blob.length();
+  //   arr.data = blob.data();
+  //   // return the time.
+  //   *rv = arr;
+  // };
+  
+  // Custom ftimer
+  // kyunam
+  auto ftimer = [pf, dev, number = 10, repeat, min_repeat_ms, limit_zero_time_iterations,
                  cooldown_interval_ms, repeats_to_cooldown, cache_flush_bytes,
-                 f_preproc](TVMArgs args, TVMRetValue* rv) mutable {
+                 f_preproc](TVMArgs args, TVMRetValue* rv) mutable -> void {
+
     TVMRetValue temp;
     std::ostringstream os;
     // skip first time call, to activate lazy compilation components.
@@ -884,7 +967,8 @@ PackedFunc WrapTimeEvaluator(PackedFunc pf, Device dev, int number, int repeat, 
       arr1 = NDArray::Empty({cache_flush_bytes / 4}, {kDLInt, 32, 1}, dev);
       arr2 = NDArray::Empty({cache_flush_bytes / 4}, {kDLInt, 32, 1}, dev);
     }
-
+    
+    // Sync device
     DeviceAPI::Get(dev)->StreamSync(dev, nullptr);
 
     for (int i = 0; i < repeat; ++i) {
@@ -893,6 +977,9 @@ PackedFunc WrapTimeEvaluator(PackedFunc pf, Device dev, int number, int repeat, 
       }
       double duration_ms = 0.0;
       int absolute_zero_times = 0;
+      double energy_mJ = 0.0;
+      bool kyunam_invalid = false;
+      double power_W = 0.0;
       do {
         if (duration_ms > 0.0) {
           const double golden_ratio = 1.618;
@@ -902,20 +989,239 @@ PackedFunc WrapTimeEvaluator(PackedFunc pf, Device dev, int number, int repeat, 
         if (cache_flush_bytes > 0) {
           arr1.CopyFrom(arr2);
         }
-        DeviceAPI::Get(dev)->StreamSync(dev, nullptr);
-        // start timing
-        Timer t = Timer::Start(dev);
-        for (int j = 0; j < number; ++j) {
-          pf.CallPacked(args, &temp);
-        }
-        t->Stop();
-        int64_t t_nanos = t->SyncAndGetElapsedNanos();
-        if (t_nanos == 0) absolute_zero_times++;
-        duration_ms = t_nanos / 1e6;
-      } while (duration_ms < min_repeat_ms && absolute_zero_times < limit_zero_time_iterations);
+        
+        if (static_cast<int>(dev.device_type) == static_cast<int>(kDLCPU)) {
+          // RAPL energy file path
+          std::string file_path = "/sys/class/powercap/intel-rapl/intel-rapl:0/energy_uj";
+          std::ifstream file;
 
-      double speed = duration_ms / 1e3 / number;
-      os.write(reinterpret_cast<char*>(&speed), sizeof(speed));
+          // Energy values to be read
+          double energy_begin, energy_end;
+          
+          // Sync device
+          DeviceAPI::Get(dev)->StreamSync(dev, nullptr);
+          
+          // Start timer
+          Timer t = Timer::Start(dev);
+
+          // Read energy value
+          file.open(file_path);
+          file >> energy_begin;
+          file.close();
+
+          for (int j = 0; j < number; ++j) {
+            pf.CallPacked(args, &temp);
+          }
+
+          // Read energy value again
+          file.open(file_path);
+          file >> energy_end;
+          file.close();
+
+          // Stop timer
+          t->Stop();
+
+          // Convert total time to ms
+          int64_t t_nanos = t->SyncAndGetElapsedNanos();
+          if (t_nanos == 0) absolute_zero_times++;
+          duration_ms = t_nanos / 1e6;
+
+          // Convert total energy to mJ
+          energy_mJ = (energy_end - energy_begin) / 1e3;
+
+          // Check if the calculated energy value is normal
+          // If energy_mJ < 0, the RAPL energy file wrapped-around
+          // --> Need to measure again
+          // If energy_mJ ~= 0, the RAPL energy file has not been updated yet
+          // --> Need to extend the measurement interval
+          kyunam_invalid = (energy_mJ < 1);
+        } else if (static_cast<int>(dev.device_type) == static_cast<int>(kDLCUDA)) {
+          // Set min_repeat_ms to 1000 to ensure enough samples are collected
+          min_repeat_ms = 1000;
+
+          // Create a pipe to capture child process output.
+          int fd[2];
+          if (pipe(fd) == -1) std::cout << "Pipe creation failed.\n";
+
+	        // Fork to create a child process.
+          pid_t pid = fork();
+          if (pid < 0) std::cout << "Fork failed.\n";
+
+	        if (pid == 0) {
+            // Child process:
+            close(fd[0]);               // Close read end.
+            dup2(fd[1], STDOUT_FILENO); // Redirect stdout to the pipe.
+            close(fd[1]);               // Close original write descriptor.
+            
+            // Execute the supported power measurement tool in loop mode (runs until SIGINT is received)
+            struct stat buf;
+            char* path = "/usr/bin/nvidia-smi";
+            bool nvidia_smi_exists = (stat(path, &buf) == 0);
+            path = "/usr/bin/tegrastats";
+            bool tegrastats_exists = (stat(path, &buf) == 0);
+
+            if (nvidia_smi_exists) {
+              execl("/usr/bin/nvidia-smi", "nvidia-smi",
+              "--query-gpu", "power.draw.instant",
+              "--format=csv,noheader,nounits",
+              "--loop-ms=100",
+              (char *)nullptr);
+            } else if (tegrastats_exists) {
+              const char *cmd =
+                // exit when receiving SIGINT
+                "trap 'exit' INT; "
+              
+                // locate the first matching hwmon directory for each sensor
+                "for d in /sys/bus/i2c/drivers/ina3221/1-0040/hwmon/hwmon*; do DIR0=\"$d\"; break; done; "
+                "for d in /sys/bus/i2c/drivers/ina3221/1-0041/hwmon/hwmon*; do DIR1=\"$d\"; break; done; "
+
+                // verify each expanded glob points to a directory
+                "if [ ! -d $DIR0 ]; then echo 'Error: DIR0 not found' >&2; exit 1; fi; "
+                "if [ ! -d $DIR1 ]; then echo 'Error: DIR1 not found' >&2; exit 1; fi; "
+        
+                // validate labels in DIR0
+                "if [ \"$(<$DIR0/in1_label)\" != 'VDD_GPU_SOC' ]; then "
+                    "echo 'Error: DIR0 in1_label != VDD_GPU_SOC' >&2; exit 1; "
+                "fi; "
+                "if [ \"$(<$DIR0/in2_label)\" != 'VDD_CPU_CV' ]; then "
+                    "echo 'Error: DIR0 in2_label != VDD_CPU_CV' >&2; exit 1; "
+                "fi; "
+                "if [ \"$(<$DIR0/in3_label)\" != 'VIN_SYS_5V0' ]; then "
+                    "echo 'Error: DIR0 in3_label != VIN_SYS_5V0' >&2; exit 1; "
+                "fi; "
+        
+                // validate label in DIR1
+                "if [ \"$(<$DIR1/in2_label)\" != 'VDDQ_VDD2_1V8AO' ]; then "
+                    "echo 'Error: DIR1 in2_label != VDDQ_VDD2_1V8AO' >&2; exit 1; "
+                "fi; "
+
+                // sampling loop: every 100ms, read inputs, multiply & sum, divide by 1e6
+                "while sleep .1; do "
+                    "awk "
+                    "-v v1=$(<$DIR0/in1_input) -v c1=$(<$DIR0/curr1_input) "
+                    "-v v2=$(<$DIR0/in2_input) -v c2=$(<$DIR0/curr2_input) "
+                    "-v v3=$(<$DIR0/in3_input) -v c3=$(<$DIR0/curr3_input) "
+                    "-v v4=$(<$DIR1/in2_input) -v c4=$(<$DIR1/curr2_input) "
+                    "'BEGIN{print (v1*c1 + v2*c2 + v3*c3 + v4*c4)/1e6}'; "
+                "done";
+              execl("/usr/bin/bash", "bash", "-c", cmd, (char *)nullptr);
+            } else {
+              std::cout << "No supported power measurement tool: nvidia-smi, tegrastats" << std::endl;
+            }
+
+            // Should not reach here.
+            std::cout << "execl failed" << std::endl;
+	          _exit(127); 
+          }
+
+	        // Parent process:
+          close(fd[1]); // Close write end; we only read in parent.
+
+	        // Start a reader thread to capture output lines.
+          std::vector<std::string> lines;
+	        std::thread reader([&]() {
+            constexpr size_t bufferSize = 10;
+            char buffer[bufferSize];
+            // Open a FILE* stream for easier line-based reading.
+            FILE* stream = fdopen(fd[0], "r");
+            if (!stream) return;
+            while (fgets(buffer, bufferSize, stream) != nullptr) {
+              std::string s(buffer);
+              // Remove any trailing newline.
+              if (!s.empty() && s.back() == '\n') {
+                s.pop_back();
+              }
+              lines.push_back(s);
+            }
+            fclose(stream);
+          });
+
+          DeviceAPI::Get(dev)->StreamSync(dev, nullptr);
+          // start timing
+          Timer t = Timer::Start(dev);
+          for (int j = 0; j < number; ++j) {
+            pf.CallPacked(args, &temp);
+          }
+          t->Stop();
+          int64_t t_nanos = t->SyncAndGetElapsedNanos();
+          if (t_nanos == 0) absolute_zero_times++;
+          duration_ms = t_nanos / 1e6;
+
+          // After work is finished and the child is alive, send SIGINT (Ctrl+C) to the child process.
+          if (duration_ms < 300) usleep((300 - duration_ms) * 1000);
+          kill(pid, SIGINT);
+          // Wait for the child process to terminate.
+          int status;
+          waitpid(pid, &status, 0);
+
+          // Wait for the reader thread to finish reading.
+          reader.join();
+
+	        // Check if we collected enough lines (need at least 8 to have meaningful average data).
+          if (lines.size() <= 7) {
+            kyunam_invalid = true;
+	        } else {
+            // Discard the first five and last two lines, then average the rest.
+            double sum = 0;
+            int count = 0;
+            for (size_t i = 5; i < lines.size() - 2; ++i) {
+              try {
+                sum += std::stod(lines[i]);
+                ++count;
+              } catch (...) {
+                // Skip conversion errors.
+              }
+            }
+            if (count > 0) {
+              power_W = sum / count;
+              kyunam_invalid = false;
+            } else {
+              kyunam_invalid = true;
+            }
+	        }
+        } else {
+          DeviceAPI::Get(dev)->StreamSync(dev, nullptr);
+          // start timing
+          Timer t = Timer::Start(dev);
+          for (int j = 0; j < number; ++j) {
+            pf.CallPacked(args, &temp);
+          }
+          t->Stop();
+          int64_t t_nanos = t->SyncAndGetElapsedNanos();
+          if (t_nanos == 0) absolute_zero_times++;
+          duration_ms = t_nanos / 1e6;
+        } 
+      } while ((duration_ms < min_repeat_ms && absolute_zero_times < limit_zero_time_iterations) || (kyunam_invalid));
+
+      // Generate the final value to be written to ostream (returned to python)
+      double final_value;
+      double delay = duration_ms / 1e3 / number; // unit: sec
+      double power;
+      if (static_cast<int>(dev.device_type) == static_cast<int>(kDLCPU)) power = energy_mJ / duration_ms; // unit: W
+      else if (static_cast<int>(dev.device_type) == static_cast<int>(kDLCUDA)) power = power_W; 
+      else power = 0;
+
+      // Check if power capping is enabled (power cap set to >0)
+      // If enabled, and measured power > cap, force the latency to be a large value
+      const char* val = std::getenv("TVMP_POWER_CAP");
+      int power_cap = (val != nullptr) ? std::atoi(val) : 0;
+      if ((power_cap > 0) && (power > power_cap)) delay = delay + 50;
+
+      // Final value contains both power and delay information
+      power = std::floor(power * 10.0) / 10.0; // Truncate to 1 decimal place, so it doesn't interfere with latency part
+      final_value = power * 1e3 + delay; // Assume delay < 100s
+      std::cout << std::fixed << std::setprecision(9);
+      std::cout << "<profiling.cc> power (W) = " << power << ", latency (us) = " << (delay * 1e6) << ", final_value = " << final_value << std::endl;
+
+      // Check if the final_value is valid
+      // if (delay >= 100) std::cout << "***** Latency >= 100 secs! final_value is corrupted. *****" << std::endl; 
+      double recovered_power = std::floor((final_value / 1000.0) * 10.0) / 10.0;
+      double recovered_delay = final_value - (recovered_power * 1000.0);
+      if (std::fabs(recovered_power - power) / std::fabs(power) > 0.05) std::cout << "***** final_value is corrupted: recovered power is " << recovered_power << "W *****" << std::endl;
+      if (std::fabs(recovered_delay - delay) / std::fabs(delay) > 0.05) std::cout << "***** final_value is corrupted: recovered delay is " << recovered_delay << "s *****" << std::endl;
+
+      // Write the final value to ostream
+      os.write(reinterpret_cast<char*>(&final_value), sizeof(final_value));
 
       if (cooldown_interval_ms > 0 && (i % repeats_to_cooldown) == 0) {
         std::this_thread::sleep_for(std::chrono::milliseconds(cooldown_interval_ms));
@@ -929,6 +1235,7 @@ PackedFunc WrapTimeEvaluator(PackedFunc pf, Device dev, int number, int repeat, 
     // return the time.
     *rv = arr;
   };
+  
   return PackedFunc(ftimer);
 }
 

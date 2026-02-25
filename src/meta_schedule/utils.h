@@ -56,6 +56,8 @@
 #include "../tir/schedule/primitive.h"
 #include "../tir/schedule/utils.h"
 
+#include <cstdlib> // kyunam
+
 #define TVM_PY_LOG(logging_level, logger)                                \
   ::tvm::meta_schedule::PyLogMessage(__FILE__, __LINE__, logger,         \
                                      PyLogMessage::Level::logging_level) \
@@ -469,7 +471,31 @@ inline Array<Integer> AsIntArray(const ObjectRef& obj) {
   return results;
 }
 
-/*! \brief The struct defining comparison function of sorting by mean run seconds. */
+// /*! \brief The struct defining comparison function of sorting by mean run seconds. */
+// struct SortTuningRecordByMeanRunSecs {
+//   static const constexpr double kMaxMeanTime = 1e10;
+
+//   static double Mean(const Array<FloatImm>& a) {
+//     if (a.empty()) {
+//       return kMaxMeanTime;
+//     }
+//     double sum = 0.0;
+//     for (const FloatImm& i : a) {
+//       sum += i->value;
+//     }
+//     return sum / a.size();
+//   }
+
+//   bool operator()(const TuningRecord& a, const TuningRecord& b) const {
+//     double a_time = Mean(a->run_secs.value_or({}));
+//     double b_time = Mean(b->run_secs.value_or({}));
+//     return a_time < b_time;
+//   }
+// };
+
+/*! \brief The struct defining comparison function of sorting by T (kyunam).
+Here, a power-incompliant schedule's modified latency value (50sec + original_latency) should be recorded as is in the database,
+so that TVM does not choose the power-incompliant schedule when deploying the model. */
 struct SortTuningRecordByMeanRunSecs {
   static const constexpr double kMaxMeanTime = 1e10;
 
@@ -485,9 +511,32 @@ struct SortTuningRecordByMeanRunSecs {
   }
 
   bool operator()(const TuningRecord& a, const TuningRecord& b) const {
-    double a_time = Mean(a->run_secs.value_or({}));
-    double b_time = Mean(b->run_secs.value_or({}));
-    return a_time < b_time;
+    // Get power exponent and delay exponent from environment variables
+    // Default T = (power ^ 0) * (delay ^ 1) = delay
+    const char* p = std::getenv("TVMP_POWER_EXP");
+    double power_exp = p ? std::strtod(p, nullptr) : 0.0;
+    p = std::getenv("TVMP_LATENCY_EXP");
+    double delay_exp = p ? std::strtod(p, nullptr) : 1.0;
+    
+    // Extract power and delay from the cost
+    double a_cost = Mean(a->run_secs.value_or({}));
+    double a_power = std::floor((a_cost / 1000.0) * 10.0) / 10.0;
+    double a_delay = a_cost - (a_power * 1000.0);
+    if (a_power > 1e6 || a_delay == 0) a_delay = 1e10; // Account for failed candidates
+
+    // Calculate T = (power ^ TVMP_POWER_EXP) * (delay ^ TVMP_DELAY_EXP)
+    double a_T = std::pow(a_power, power_exp) * std::pow(a_delay, delay_exp); 
+
+    // Extract power and delay from the cost
+    double b_cost = Mean(b->run_secs.value_or({}));
+    double b_power = std::floor((b_cost / 1000.0) * 10.0) / 10.0;
+    double b_delay = b_cost - (b_power * 1000.0); 
+    if (b_power > 1e6 || b_delay == 0) b_delay = 1e10; // Account for failed candidates
+
+    // Calculate T = (power ^ TVMP_POWER_EXP) * (delay ^ TVMP_DELAY_EXP)
+    double b_T = std::pow(b_power, power_exp) * std::pow(b_delay, delay_exp); 
+
+    return a_T < b_T;
   }
 };
 
